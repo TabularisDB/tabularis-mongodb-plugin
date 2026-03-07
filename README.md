@@ -5,9 +5,9 @@
 # tabularis-mongodb-plugin
 <p align="center">
 
-![](https://img.shields.io/github/release/debba/tabularis-plugin-mongodb.svg?style=flat)
-![](https://img.shields.io/github/downloads/debba/tabularis-plugin-mongodb/total.svg?style=flat)
-![Build & Release](https://github.com/debba/tabularis-plugin-mongodb/workflows/Release/badge.svg)
+![](https://img.shields.io/github/release/debba/tabularis-mongodb-plugin.svg?style=flat)
+![](https://img.shields.io/github/downloads/debba/tabularis-mongodb-plugin/total.svg?style=flat)
+![Build & Release](https://github.com/debba/tabularis-mongodb-plugin/workflows/Release/badge.svg)
 [![Discord](https://img.shields.io/discord/1470772941296894128?color=5865F2&logo=discord&logoColor=white)](https://discord.gg/YrZPHAwMSG)
 
 </p>
@@ -63,7 +63,7 @@ If your version of Tabularis supports plugin management, the MongoDB plugin can 
 
 ### Manual Installation
 
-1. Download the latest release for your platform from the [Releases page](https://github.com/debba/tabularis-plugin-mongodb/releases).
+1. Download the latest release for your platform from the [Releases page](https://github.com/debba/tabularis-mongodb-plugin/releases).
 2. Extract the archive.
 3. Copy `tabularis-mongodb-plugin` (or `tabularis-mongodb-plugin.exe` on Windows) and `manifest.json` into the Tabularis plugins directory:
 
