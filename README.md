@@ -21,6 +21,7 @@ This plugin enables Tabularis to connect to any MongoDB instance and provides co
 ## Table of Contents
 
 - [Features](#features)
+- [Connection Configuration](#connection-configuration)
 - [Supported MongoDB Data Types](#supported-mongodb-data-types)
 - [Installation](#installation)
   - [Automatic (via Tabularis)](#automatic-via-tabularis)
@@ -35,7 +36,7 @@ This plugin enables Tabularis to connect to any MongoDB instance and provides co
 
 ## Features
 
-- **Connection** — Connect to any MongoDB instance via host/port or full URI, with optional authentication.
+- **Connection** — Connect through legacy host/port fields or a full `mongodb://` or `mongodb+srv://` URI, including MongoDB Atlas, replica sets, multi-host deployments, and driver options.
 - **Collection Browsing** — List databases, collections, and infer schema by sampling documents.
 - **Schema Inference** — Automatically detects field names and BSON types by sampling up to 100 documents per collection.
 - **Index Inspection** — List collection indexes with name, columns, uniqueness, and primary flag.
@@ -44,6 +45,17 @@ This plugin enables Tabularis to connect to any MongoDB instance and provides co
 - **ObjectId Handling** — Automatically converts string primary key values to `ObjectId` when filtering by `_id`.
 - **DDL-equivalent Generation** — Generates MongoDB shell commands for `createCollection`, `createIndex`, `$rename`, and more.
 - **Cross-platform** — Pre-built binaries for Linux (x86_64, aarch64), macOS (x86_64, aarch64), and Windows (x86_64).
+
+## Connection Configuration
+
+The plugin supports two connection formats:
+
+- **Full URI** — Pass `connection_uri` with either the `mongodb://` or `mongodb+srv://` scheme. The URI is forwarded to the official MongoDB driver, preserving Atlas DNS discovery, multiple hosts, replica-set settings, TLS settings, authentication options, and other query parameters. When present, the full URI takes precedence over legacy fields.
+- **Legacy fields** — Existing `host`, `port`, `user`, `password`, and `database` connection fields remain supported. The plugin assembles them into a standard MongoDB URI, so existing Tabularis connections continue to work.
+
+The selected database can be supplied by the request `schema`, by the connection's `database` field (as either a string or an array), or by the URI path. If none is provided, the plugin uses `admin`.
+
+Sending `connection_uri` requires the Tabularis host support introduced by [TabularisDB/tabularis#495](https://github.com/TabularisDB/tabularis/pull/495). Older Tabularis versions can continue to use the legacy connection fields.
 
 ## Supported MongoDB Data Types
 
@@ -174,9 +186,9 @@ Two development binaries are included:
 
 ```bash
 cargo run --bin test
-# or with a custom URI:
-MONGODB_URI="mongodb://user:pass@host:27017/mydb" cargo run --bin test
 ```
+
+For a custom or authenticated server, load `MONGODB_URI` into the environment through your shell's secret-manager integration before running the command. Do not print or commit the URI.
 
 **Simulated Tabularis integration test** (spawns the plugin and sends JSON-RPC requests via stdio):
 

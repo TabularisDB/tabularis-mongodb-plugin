@@ -48,12 +48,30 @@ fn main() {
         let params = &req["params"];
         let conn_params = &params["params"];
 
-        let uri = build_uri(conn_params);
-        let db_name = conn_params
-            .get("database")
-            .and_then(|d| d.as_str())
-            .unwrap_or("admin")
-            .to_string();
+        let uri = match build_uri(conn_params) {
+            Ok(uri) => uri,
+            Err(error) => {
+                send_error(&mut stdout, id, -32602, &error);
+                continue;
+            }
+        };
+        let explicit_database = match get_database_param(conn_params) {
+            Ok(database) => database,
+            Err(error) => {
+                send_error(&mut stdout, id, -32602, &error);
+                continue;
+            }
+        };
+        // Multi-database navigation: the host sends the database the user
+        // selected in the request-level `schema` field, which outranks the
+        // database stored on the connection.
+        let request_database = match get_string_param(params, "schema") {
+            Ok(database) => database.map(str::to_owned),
+            Err(error) => {
+                send_error(&mut stdout, id, -32602, &error);
+                continue;
+            }
+        };
 
         let client = match get_or_create_client(&rt, &mut clients, &uri) {
             Ok(c) => c,
@@ -67,14 +85,17 @@ fn main() {
                 continue;
             }
         };
+        let default_database = client.default_database();
+        let db_name = resolve_database_name(
+            request_database.as_deref().or(explicit_database.as_deref()),
+            default_database.as_ref().map(|database| database.name()),
+        );
 
         match method.as_str() {
-            "test_connection" => {
-                match rt.block_on(test_connection(client, &db_name)) {
-                    Ok(v) => send_success(&mut stdout, id, v),
-                    Err(e) => send_error(&mut stdout, id, -32000, &e),
-                }
-            }
+            "test_connection" => match rt.block_on(test_connection(client, &db_name)) {
+                Ok(v) => send_success(&mut stdout, id, v),
+                Err(e) => send_error(&mut stdout, id, -32000, &e),
+            },
             "get_databases" => {
                 let result = rt.block_on(get_databases(client, &db_name));
                 send_success(&mut stdout, id, result);
@@ -235,11 +256,7 @@ fn main() {
                         )]),
                     );
                 } else {
-                    send_success(
-                        &mut stdout,
-                        id,
-                        json!(["// No rename needed in MongoDB"]),
-                    );
+                    send_success(&mut stdout, id, json!(["// No rename needed in MongoDB"]));
                 }
             }
             "get_create_index_sql" => {
@@ -314,36 +331,317 @@ fn main() {
 // Connection management
 // ---------------------------------------------------------------------------
 
-fn build_uri(params: &JsonValue) -> String {
-    let host = params
-        .get("host")
-        .and_then(|h| h.as_str())
-        .unwrap_or("localhost");
-    let port = params
-        .get("port")
-        .and_then(|p| p.as_u64())
-        .unwrap_or(27017);
-    let database = params
-        .get("database")
-        .and_then(|d| d.as_str())
-        .unwrap_or("admin");
-    let username = params
-        .get("username")
-        .and_then(|u| u.as_str())
-        .unwrap_or("");
-    let password = params
-        .get("password")
-        .and_then(|p| p.as_str())
-        .unwrap_or("");
+fn build_uri(params: &JsonValue) -> Result<String, String> {
+    const URI_KEYS: [&str; 7] = [
+        "connection_string",
+        "connectionString",
+        "connection_uri",
+        "connectionUri",
+        "uri",
+        "url",
+        "dsn",
+    ];
 
-    if !username.is_empty() {
+    for key in URI_KEYS {
+        if let Some(uri) = get_string_param(params, key)? {
+            validate_mongo_scheme(uri)?;
+            return Ok(uri.to_string());
+        }
+    }
+
+    let host = get_string_param(params, "host")?.unwrap_or("localhost");
+    let port = params.get("port").and_then(|p| p.as_u64()).unwrap_or(27017);
+    let database = get_database_param(params)?.unwrap_or_else(|| "admin".to_string());
+    let username = get_string_param(params, "username")?.unwrap_or("");
+    let password = get_string_param(params, "password")?.unwrap_or("");
+
+    let mut uri = if !username.is_empty() {
         format!(
             "mongodb://{}:{}@{}:{}/{}",
-            username, password, host, port, database
+            encode_uri_component(username),
+            encode_uri_component(password),
+            host,
+            port,
+            database
         )
     } else {
         format!("mongodb://{}:{}/{}", host, port, database)
+    };
+
+    append_query_options(&mut uri, params)?;
+    Ok(uri)
+}
+
+/// The host stores `database` as a string for single-database drivers and as
+/// an array of selected names for multi-database ones. Accept both; for an
+/// array the first entry is the initial database, and an empty array means
+/// none was chosen yet.
+fn get_database_param(params: &JsonValue) -> Result<Option<String>, String> {
+    match params.get("database") {
+        None | Some(JsonValue::Null) => Ok(None),
+        Some(JsonValue::String(value)) if value.trim().is_empty() => Ok(None),
+        Some(JsonValue::String(value)) => Ok(Some(value.clone())),
+        Some(JsonValue::Array(values)) => match values.first() {
+            None => Ok(None),
+            Some(JsonValue::String(value)) if value.trim().is_empty() => Ok(None),
+            Some(JsonValue::String(value)) => Ok(Some(value.clone())),
+            Some(_) => Err("Parameter 'database' must contain strings".to_string()),
+        },
+        Some(_) => Err("Parameter 'database' must be a string or an array of strings".to_string()),
     }
+}
+
+fn get_string_param<'a>(params: &'a JsonValue, key: &str) -> Result<Option<&'a str>, String> {
+    match params.get(key) {
+        None | Some(JsonValue::Null) => Ok(None),
+        Some(JsonValue::String(value)) if value.trim().is_empty() => Ok(None),
+        Some(JsonValue::String(value)) => Ok(Some(value)),
+        Some(_) => Err(format!("Parameter '{key}' must be a string")),
+    }
+}
+
+fn resolve_database_name(explicit_database: Option<&str>, uri_database: Option<&str>) -> String {
+    explicit_database
+        .or(uri_database.filter(|database| !database.is_empty()))
+        .unwrap_or("admin")
+        .to_string()
+}
+
+fn validate_mongo_scheme(uri: &str) -> Result<(), String> {
+    if uri.starts_with("mongodb://") || uri.starts_with("mongodb+srv://") {
+        Ok(())
+    } else {
+        Err("Unsupported MongoDB URI scheme; expected mongodb:// or mongodb+srv://".to_string())
+    }
+}
+
+fn get_bool_param(params: &JsonValue, key: &str) -> Result<Option<bool>, String> {
+    match params.get(key) {
+        None | Some(JsonValue::Null) => Ok(None),
+        Some(JsonValue::Bool(value)) => Ok(Some(*value)),
+        Some(JsonValue::String(value)) if value.trim().is_empty() => Ok(None),
+        Some(JsonValue::String(value)) if value.eq_ignore_ascii_case("true") => Ok(Some(true)),
+        Some(JsonValue::String(value)) if value.eq_ignore_ascii_case("false") => Ok(Some(false)),
+        Some(_) => Err(format!("Parameter '{key}' must be a boolean")),
+    }
+}
+
+fn append_query_options(uri: &mut String, params: &JsonValue) -> Result<(), String> {
+    let mut options = Vec::new();
+    let mut names = HashSet::new();
+
+    for key in ["tls", "ssl"] {
+        if let Some(value) = get_bool_param(params, key)? {
+            push_query_option(&mut options, &mut names, key, value.to_string())?;
+        }
+    }
+
+    for key in ["authSource", "replicaSet"] {
+        if let Some(value) = get_string_param(params, key)? {
+            push_query_option(&mut options, &mut names, key, value.to_string())?;
+        }
+    }
+
+    if let Some(value) = get_bool_param(params, "retryWrites")? {
+        push_query_option(&mut options, &mut names, "retryWrites", value.to_string())?;
+    }
+
+    if let Some(value) = get_write_concern(params)? {
+        push_query_option(&mut options, &mut names, "w", value)?;
+    }
+
+    if let Some(value) = get_string_param(params, "appName")? {
+        push_query_option(&mut options, &mut names, "appName", value.to_string())?;
+    }
+
+    if let Some(value) = get_bool_param(params, "directConnection")? {
+        push_query_option(
+            &mut options,
+            &mut names,
+            "directConnection",
+            value.to_string(),
+        )?;
+    }
+
+    append_extra_options(params, &mut options, &mut names)?;
+
+    if !options.is_empty() {
+        uri.push('?');
+        uri.push_str(
+            &options
+                .into_iter()
+                .map(|(key, value)| {
+                    format!(
+                        "{}={}",
+                        encode_uri_component(&key),
+                        encode_uri_component(&value)
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("&"),
+        );
+    }
+
+    Ok(())
+}
+
+fn get_write_concern(params: &JsonValue) -> Result<Option<String>, String> {
+    match params.get("w") {
+        None | Some(JsonValue::Null) => Ok(None),
+        Some(JsonValue::String(value)) if value.trim().is_empty() => Ok(None),
+        Some(JsonValue::String(value)) => Ok(Some(value.clone())),
+        Some(JsonValue::Number(value)) => Ok(Some(value.to_string())),
+        Some(_) => Err("Parameter 'w' must be a string or number".to_string()),
+    }
+}
+
+fn append_extra_options(
+    params: &JsonValue,
+    options: &mut Vec<(String, String)>,
+    names: &mut HashSet<String>,
+) -> Result<(), String> {
+    let Some(extra_options) = params.get("extra_options") else {
+        return Ok(());
+    };
+
+    match extra_options {
+        JsonValue::Null => Ok(()),
+        JsonValue::Object(values) => {
+            let mut entries: Vec<_> = values.iter().collect();
+            entries.sort_by(|(left, _), (right, _)| left.cmp(right));
+
+            for (key, value) in entries {
+                let value = query_scalar_to_string(value, key)?;
+                push_query_option(options, names, key, value)?;
+            }
+            Ok(())
+        }
+        JsonValue::String(value) => append_extra_options_string(value, options, names),
+        _ => Err("Parameter 'extra_options' must be an object or query string".to_string()),
+    }
+}
+
+fn append_extra_options_string(
+    value: &str,
+    options: &mut Vec<(String, String)>,
+    names: &mut HashSet<String>,
+) -> Result<(), String> {
+    let query = value.trim().strip_prefix('?').unwrap_or(value.trim());
+    if query.is_empty() {
+        return Ok(());
+    }
+
+    for pair in query.split('&') {
+        let Some((key, value)) = pair.split_once('=') else {
+            return Err("Parameter 'extra_options' must contain key=value query pairs".to_string());
+        };
+        if key.is_empty()
+            || value.is_empty()
+            || key.chars().any(char::is_whitespace)
+            || value.chars().any(char::is_whitespace)
+            || key.contains(['?', '#'])
+            || value.contains(['?', '#'])
+        {
+            return Err("Parameter 'extra_options' contains an invalid query pair".to_string());
+        }
+        push_query_option(options, names, key, value.to_string())?;
+    }
+
+    Ok(())
+}
+
+fn query_scalar_to_string(value: &JsonValue, key: &str) -> Result<String, String> {
+    match value {
+        JsonValue::String(value) if !value.is_empty() => Ok(value.clone()),
+        JsonValue::Bool(value) => Ok(value.to_string()),
+        JsonValue::Number(value) => Ok(value.to_string()),
+        _ => Err(format!(
+            "Extra option '{key}' must have a non-empty scalar value"
+        )),
+    }
+}
+
+fn push_query_option(
+    options: &mut Vec<(String, String)>,
+    names: &mut HashSet<String>,
+    key: &str,
+    value: String,
+) -> Result<(), String> {
+    if key.is_empty() {
+        return Err("MongoDB query option names cannot be empty".to_string());
+    }
+    if !names.insert(key.to_string()) {
+        return Err(format!(
+            "MongoDB query option '{key}' was provided more than once"
+        ));
+    }
+    options.push((key.to_string(), value));
+    Ok(())
+}
+
+fn encode_uri_component(value: &str) -> String {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    let mut encoded = String::with_capacity(value.len());
+
+    for byte in value.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~') {
+            encoded.push(byte as char);
+        } else {
+            encoded.push('%');
+            encoded.push(HEX[(byte >> 4) as usize] as char);
+            encoded.push(HEX[(byte & 0x0f) as usize] as char);
+        }
+    }
+
+    encoded
+}
+
+fn mask_mongo_uri(value: &str) -> String {
+    const SCHEMES: [&str; 2] = ["mongodb+srv://", "mongodb://"];
+    let mut masked = String::with_capacity(value.len());
+    let mut cursor = 0;
+
+    loop {
+        let next_scheme = SCHEMES
+            .iter()
+            .filter_map(|scheme| value[cursor..].find(scheme).map(|index| (index, *scheme)))
+            .min_by_key(|(index, _)| *index);
+
+        let Some((scheme_index, scheme)) = next_scheme else {
+            masked.push_str(&value[cursor..]);
+            break;
+        };
+
+        let uri_start = cursor + scheme_index;
+        let uri_body_start = uri_start + scheme.len();
+        masked.push_str(&value[cursor..uri_start]);
+        masked.push_str(scheme);
+        masked.push_str("<redacted>");
+
+        let opening_quote = value[..uri_start]
+            .chars()
+            .next_back()
+            .filter(|character| matches!(character, '"' | '\''));
+        let token_end = match opening_quote {
+            Some(quote) => value[uri_body_start..]
+                .find(quote)
+                .map(|index| uri_body_start + index)
+                .unwrap_or(value.len()),
+            None => value[uri_body_start..]
+                .find(|character: char| {
+                    character.is_whitespace() || matches!(character, '"' | '\'')
+                })
+                .map(|index| uri_body_start + index)
+                .unwrap_or(value.len()),
+        };
+        cursor = token_end;
+    }
+
+    masked
+}
+
+fn safe_mongo_error(error: impl std::fmt::Display) -> String {
+    mask_mongo_uri(&error.to_string())
 }
 
 fn get_or_create_client<'a>(
@@ -352,9 +650,12 @@ fn get_or_create_client<'a>(
     uri: &str,
 ) -> Result<&'a Client, String> {
     if !clients.contains_key(uri) {
-        let client = rt
-            .block_on(Client::with_uri_str(uri))
-            .map_err(|e| format!("Failed to create MongoDB client: {}", e))?;
+        let client = rt.block_on(Client::with_uri_str(uri)).map_err(|error| {
+            format!(
+                "Failed to create MongoDB client: {}",
+                safe_mongo_error(error)
+            )
+        })?;
         clients.insert(uri.to_string(), client);
     }
     Ok(clients.get(uri).unwrap())
@@ -400,7 +701,7 @@ async fn test_connection(client: &Client, db_name: &str) -> Result<JsonValue, St
     db.run_command(doc! { "ping": 1 })
         .await
         .map(|_| json!({ "success": true }))
-        .map_err(|e| e.to_string())
+        .map_err(safe_mongo_error)
 }
 
 async fn get_databases(client: &Client, db_name: &str) -> JsonValue {
@@ -412,13 +713,10 @@ async fn get_databases(client: &Client, db_name: &str) -> JsonValue {
 
 async fn get_collections(client: &Client, db_name: &str) -> Result<JsonValue, String> {
     let db = client.database(db_name);
-    let names = db
-        .list_collection_names()
-        .await
-        .map_err(|e| e.to_string())?;
+    let names = db.list_collection_names().await.map_err(safe_mongo_error)?;
     let result: Vec<JsonValue> = names
         .iter()
-        .map(|name| json!({ "name": name, "schema": null, "comment": null }))
+        .map(|name| json!({ "name": name, "schema": db_name, "comment": null }))
         .collect();
     Ok(json!(result))
 }
@@ -438,7 +736,7 @@ async fn get_columns(
         .find(doc! {})
         .with_options(options)
         .await
-        .map_err(|e| e.to_string())?;
+        .map_err(safe_mongo_error)?;
 
     // field name → list of observed BSON type names
     let mut field_types: HashMap<String, Vec<&'static str>> = HashMap::new();
@@ -447,7 +745,7 @@ async fn get_columns(
     let mut total_docs = 0usize;
 
     while let Some(result) = cursor.next().await {
-        let doc: Document = result.map_err(|e| e.to_string())?;
+        let doc: Document = result.map_err(safe_mongo_error)?;
         total_docs += 1;
         for (key, value) in &doc {
             *field_seen.entry(key.clone()).or_insert(0) += 1;
@@ -522,7 +820,7 @@ async fn get_indexes(
     let cmd_result = db
         .run_command(doc! { "listIndexes": collection_name })
         .await
-        .map_err(|e| e.to_string())?;
+        .map_err(safe_mongo_error)?;
 
     let cursor_doc = cmd_result
         .get_document("cursor")
@@ -749,6 +1047,9 @@ fn parse_sql_from_clause(query: &str) -> Option<String> {
     let from_pos = upper.find(" FROM ")?;
     let rest = query[from_pos + 6..].trim();
     let name: &str = rest.split_whitespace().next()?;
+    // The host quotes identifiers (`SELECT * FROM "plans"`); the quotes are
+    // not part of the collection name.
+    let name = name.trim_matches(|c| c == '"' || c == '`' || c == '\'');
     if name.is_empty() {
         None
     } else {
@@ -770,7 +1071,16 @@ async fn execute_query(
     }
 
     if let Some(collection_name) = parse_sql_from_clause(q) {
-        return execute_find(client, db_name, &collection_name, doc! {}, None, limit, page).await;
+        return execute_find(
+            client,
+            db_name,
+            &collection_name,
+            doc! {},
+            None,
+            limit,
+            page,
+        )
+        .await;
     }
 
     Err(
@@ -814,7 +1124,7 @@ async fn dispatch_shell_query(
             let count = collection
                 .count_documents(filter)
                 .await
-                .map_err(|e| e.to_string())?;
+                .map_err(safe_mongo_error)?;
             Ok(json!({
                 "columns": ["count"],
                 "rows": [[count]],
@@ -830,7 +1140,7 @@ async fn dispatch_shell_query(
             let count = collection
                 .estimated_document_count()
                 .await
-                .map_err(|e| e.to_string())?;
+                .map_err(safe_mongo_error)?;
             Ok(json!({
                 "columns": ["count"],
                 "rows": [[count]],
@@ -875,11 +1185,11 @@ async fn execute_find(
         .find(filter)
         .with_options(options)
         .await
-        .map_err(|e| e.to_string())?;
+        .map_err(safe_mongo_error)?;
 
     let mut all_docs: Vec<Document> = Vec::new();
     while let Some(result) = cursor.next().await {
-        let doc: Document = result.map_err(|e| e.to_string())?;
+        let doc: Document = result.map_err(safe_mongo_error)?;
         all_docs.push(doc);
     }
 
@@ -924,11 +1234,11 @@ async fn execute_aggregate(
     let mut cursor = collection
         .aggregate(pipeline)
         .await
-        .map_err(|e| e.to_string())?;
+        .map_err(safe_mongo_error)?;
 
     let mut all_docs: Vec<Document> = Vec::new();
     while let Some(result) = cursor.next().await {
-        let doc: Document = result.map_err(|e| e.to_string())?;
+        let doc: Document = result.map_err(safe_mongo_error)?;
         all_docs.push(doc);
     }
 
@@ -994,10 +1304,7 @@ async fn insert_record(
         })
         .collect();
 
-    collection
-        .insert_one(doc)
-        .await
-        .map_err(|e| e.to_string())?;
+    collection.insert_one(doc).await.map_err(safe_mongo_error)?;
     Ok(1)
 }
 
@@ -1025,7 +1332,7 @@ async fn update_record(
     let result = collection
         .update_one(filter, update)
         .await
-        .map_err(|e| e.to_string())?;
+        .map_err(safe_mongo_error)?;
     Ok(result.modified_count)
 }
 
@@ -1049,7 +1356,7 @@ async fn delete_record(
     let result = collection
         .delete_one(filter)
         .await
-        .map_err(|e| e.to_string())?;
+        .map_err(safe_mongo_error)?;
     Ok(result.deleted_count)
 }
 
@@ -1066,7 +1373,7 @@ async fn drop_index(
     })
     .await
     .map(|_| ())
-    .map_err(|e| e.to_string())
+    .map_err(safe_mongo_error)
 }
 
 // ---------------------------------------------------------------------------
@@ -1089,7 +1396,7 @@ async fn get_schema_snapshot(client: &Client, db_name: &str) -> Result<JsonValue
             .unwrap_or(json!([]));
         snapshots.push(json!({
             "name": name,
-            "schema": null,
+            "schema": db_name,
             "comment": null,
             "columns": columns,
             "foreign_keys": [],
@@ -1100,10 +1407,7 @@ async fn get_schema_snapshot(client: &Client, db_name: &str) -> Result<JsonValue
 
 async fn get_all_columns_batch(client: &Client, db_name: &str) -> Result<JsonValue, String> {
     let db = client.database(db_name);
-    let names = db
-        .list_collection_names()
-        .await
-        .map_err(|e| e.to_string())?;
+    let names = db.list_collection_names().await.map_err(safe_mongo_error)?;
 
     let mut result = serde_json::Map::new();
     for name in names {
@@ -1188,7 +1492,10 @@ fn json_to_bson(val: &JsonValue) -> Bson {
         JsonValue::String(s) => Bson::String(s.clone()),
         JsonValue::Array(arr) => Bson::Array(arr.iter().map(json_to_bson).collect()),
         JsonValue::Object(obj) => {
-            let doc: Document = obj.iter().map(|(k, v)| (k.clone(), json_to_bson(v))).collect();
+            let doc: Document = obj
+                .iter()
+                .map(|(k, v)| (k.clone(), json_to_bson(v)))
+                .collect();
             Bson::Document(doc)
         }
     }
@@ -1247,4 +1554,259 @@ fn docs_to_rows(docs: &[Document], columns: &[String]) -> Vec<JsonValue> {
             JsonValue::Array(row)
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sql_from_clause_strips_identifier_quotes() {
+        assert_eq!(
+            parse_sql_from_clause("SELECT * FROM \"plans\""),
+            Some("plans".to_string())
+        );
+        assert_eq!(
+            parse_sql_from_clause("SELECT * FROM `plans` LIMIT 10"),
+            Some("plans".to_string())
+        );
+        assert_eq!(
+            parse_sql_from_clause("SELECT * FROM plans"),
+            Some("plans".to_string())
+        );
+    }
+
+    #[test]
+    fn full_srv_uri_is_returned_unchanged() {
+        let uri = "mongodb+srv://user:password@cluster0.example.mongodb.net/mydb?retryWrites=true&w=majority&authSource=admin";
+        let params = json!({ "connection_string": uri });
+
+        assert_eq!(build_uri(&params).unwrap(), uri);
+    }
+
+    #[test]
+    fn full_standard_uri_with_multiple_hosts_is_returned_unchanged() {
+        let uri = "mongodb://host1:27017,host2:27017,host3:27017/mydb?tls=true&authSource=admin&replicaSet=atlas-example-shard-0";
+        let params = json!({ "connectionUri": uri });
+
+        assert_eq!(build_uri(&params).unwrap(), uri);
+    }
+
+    #[test]
+    fn database_array_uses_first_entry() {
+        // Multi-database drivers receive `database` as an array of selected
+        // names; the first one is the initial database.
+        let params = json!({ "host": "localhost", "database": ["finance", "audit"] });
+        assert_eq!(
+            build_uri(&params).unwrap(),
+            "mongodb://localhost:27017/finance"
+        );
+
+        let empty = json!({ "host": "localhost", "database": [] });
+        assert_eq!(
+            build_uri(&empty).unwrap(),
+            "mongodb://localhost:27017/admin"
+        );
+    }
+
+    #[test]
+    fn connection_uri_param_wins_over_decomposed_fields() {
+        // `connection_uri` is the exact key the Tabularis host forwards for
+        // URI-passthrough drivers; the decomposed fields it sends alongside are
+        // display-only and must not influence the URI.
+        let uri = "mongodb+srv://user:password@cluster0.example.mongodb.net/?tls=true&retryWrites=true&w=majority&appName=Cluster0";
+        let params = json!({
+            "connection_uri": uri,
+            "host": "cluster0.example.mongodb.net",
+            "port": 27017,
+            "username": "user",
+            "database": "",
+        });
+
+        assert_eq!(build_uri(&params).unwrap(), uri);
+    }
+
+    #[test]
+    fn uri_database_is_used_when_explicit_database_is_absent() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let client = runtime
+            .block_on(Client::with_uri_str("mongodb://localhost/finance"))
+            .unwrap();
+        let default_database = client.default_database();
+
+        assert_eq!(
+            resolve_database_name(
+                None,
+                default_database.as_ref().map(|database| database.name())
+            ),
+            "finance"
+        );
+    }
+
+    #[test]
+    fn explicit_database_overrides_uri_database() {
+        assert_eq!(
+            resolve_database_name(Some("reporting"), Some("finance")),
+            "reporting"
+        );
+    }
+
+    #[test]
+    fn admin_is_used_when_no_database_is_configured() {
+        assert_eq!(resolve_database_name(None, None), "admin");
+    }
+
+    #[test]
+    fn non_string_database_is_rejected() {
+        let params = json!({ "database": 42 });
+        let error = get_string_param(&params, "database").unwrap_err();
+
+        assert_eq!(error, "Parameter 'database' must be a string");
+    }
+
+    #[test]
+    fn host_port_credentials_and_database_build_a_compatible_uri() {
+        let params = json!({
+            "host": "localhost",
+            "port": 27018,
+            "database": "finance",
+            "username": "analyst",
+            "password": "secret"
+        });
+
+        assert_eq!(
+            build_uri(&params).unwrap(),
+            "mongodb://analyst:secret@localhost:27018/finance"
+        );
+    }
+
+    #[test]
+    fn credentials_are_percent_encoded_when_building_a_uri() {
+        let params = json!({
+            "host": "localhost",
+            "username": "bank/user",
+            "password": "p@ss/w#rd:$",
+            "database": "finance"
+        });
+
+        assert_eq!(
+            build_uri(&params).unwrap(),
+            "mongodb://bank%2Fuser:p%40ss%2Fw%23rd%3A%24@localhost:27017/finance"
+        );
+    }
+
+    #[test]
+    fn auth_source_is_appended_to_a_built_uri() {
+        let params = json!({
+            "host": "localhost",
+            "database": "finance",
+            "authSource": "admin"
+        });
+
+        assert_eq!(
+            build_uri(&params).unwrap(),
+            "mongodb://localhost:27017/finance?authSource=admin"
+        );
+    }
+
+    #[test]
+    fn tls_is_appended_to_a_built_uri() {
+        let params = json!({ "host": "localhost", "tls": true });
+
+        assert_eq!(
+            build_uri(&params).unwrap(),
+            "mongodb://localhost:27017/admin?tls=true"
+        );
+    }
+
+    #[test]
+    fn replica_set_is_appended_to_a_built_uri() {
+        let params = json!({
+            "host": "localhost",
+            "replicaSet": "atlas-xxxxx-shard-0"
+        });
+
+        assert_eq!(
+            build_uri(&params).unwrap(),
+            "mongodb://localhost:27017/admin?replicaSet=atlas-xxxxx-shard-0"
+        );
+    }
+
+    #[test]
+    fn unsupported_uri_scheme_returns_a_secret_free_error() {
+        let params = json!({
+            "connection_string": "postgresql://banker:top-secret@example.com/finance"
+        });
+
+        let error = build_uri(&params).unwrap_err();
+
+        assert_eq!(
+            error,
+            "Unsupported MongoDB URI scheme; expected mongodb:// or mongodb+srv://"
+        );
+        assert!(!error.contains("top-secret"));
+    }
+
+    #[test]
+    fn extra_options_are_sorted_and_percent_encoded() {
+        let params = json!({
+            "host": "localhost",
+            "extra_options": {
+                "zOption": "value with spaces",
+                "compressors": "zstd"
+            }
+        });
+
+        assert_eq!(
+            build_uri(&params).unwrap(),
+            "mongodb://localhost:27017/admin?compressors=zstd&zOption=value%20with%20spaces"
+        );
+    }
+
+    #[test]
+    fn mongo_uri_is_fully_redacted() {
+        let uri = "connection failed for mongodb+srv://banker:top-secret@cluster.example.mongodb.net/finance";
+
+        let masked = mask_mongo_uri(uri);
+
+        assert_eq!(masked, "connection failed for mongodb+srv://<redacted>");
+        assert!(!masked.contains("banker"));
+        assert!(!masked.contains("top-secret"));
+    }
+
+    #[test]
+    fn malformed_uri_delimiters_and_query_values_are_redacted() {
+        let uri = "mongodb://banker:pa/ss?token=secret#fragment@host/finance?apiKey=hidden";
+
+        let masked = mask_mongo_uri(uri);
+
+        assert_eq!(masked, "mongodb://<redacted>");
+        assert!(!masked.contains("secret"));
+        assert!(!masked.contains("hidden"));
+    }
+
+    #[test]
+    fn quoted_uri_with_whitespace_is_redacted_through_the_closing_quote() {
+        let error =
+            "failure: \"mongodb://user:bad password@host/finance?apiKey=hidden\" retry later";
+
+        assert_eq!(
+            mask_mongo_uri(error),
+            "failure: \"mongodb://<redacted>\" retry later"
+        );
+    }
+
+    #[test]
+    fn multiple_uris_and_percent_encoded_credentials_are_redacted() {
+        let error = "first mongodb://banker:p%40ss@host/finance?token=one second mongodb+srv://user:secret@cluster/ledger?token=two";
+        let masked = mask_mongo_uri(error);
+
+        assert_eq!(
+            masked,
+            "first mongodb://<redacted> second mongodb+srv://<redacted>"
+        );
+        for secret in ["banker", "p%40ss", "one", "user", "secret", "two"] {
+            assert!(!masked.contains(secret));
+        }
+    }
 }
