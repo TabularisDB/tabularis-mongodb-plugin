@@ -77,7 +77,7 @@ If your version of Tabularis supports plugin management, the MongoDB plugin can 
 
 1. Download the latest release for your platform from the [Releases page](https://github.com/debba/tabularis-mongodb-plugin/releases).
 2. Extract the archive.
-3. Copy `tabularis-mongodb-plugin` (or `tabularis-mongodb-plugin.exe` on Windows) and `manifest.json` into the Tabularis plugins directory:
+3. Copy `tabularis-mongodb-plugin` (or `tabularis-mongodb-plugin.exe` on Windows) and `.tabularium` into the Tabularis plugins directory:
 
 | OS | Plugins Directory |
 |---|---|
