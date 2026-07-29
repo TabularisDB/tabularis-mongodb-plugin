@@ -12,7 +12,10 @@
     "file_based": false,
     "connection_string": true,
     "connection_uri": true,
-    "connection_uri_schemes": ["mongodb", "mongodb+srv"],
+    "connection_uri_schemes": [
+      "mongodb",
+      "mongodb+srv"
+    ],
     "identifier_quote": "`",
     "alter_primary_key": false
   },
