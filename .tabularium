@@ -1,8 +1,9 @@
 {
   "name": "mongodb-atlas",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "kind": "driver",
   "description": "MongoDB NoSQL database driver with Atlas (mongodb+srv) support",
+  "icon": "https://raw.githubusercontent.com/TabularisDB/tabularis-mongodb-plugin/main/mongodb-logo.svg",
   "engine": "mongodb",
   "paradigms": [
     "document"
