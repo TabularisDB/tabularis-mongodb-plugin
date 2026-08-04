@@ -8,6 +8,7 @@ All notable changes to this project will be documented in this file.
 
 - *(manifest)* Satisfy the Tabularium driver-kind contract by @NewtTheWolf
 - *(ci)* Include hidden .tabularium file in manifest artifact upload by @debba
+- *(manifest)* Rename plugin slug to mongodb-atlas by @debba
 
 ### Documentation
 
