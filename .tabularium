@@ -1,8 +1,12 @@
 {
-  "id": "mongodb",
-  "name": "MongoDB",
+  "name": "mongodb",
   "version": "0.1.0",
+  "kind": "driver",
   "description": "MongoDB NoSQL database driver",
+  "engine": "mongodb",
+  "paradigms": [
+    "document"
+  ],
   "default_port": 27017,
   "executable": "tabularis-mongodb-plugin",
   "capabilities": {
