@@ -2,9 +2,24 @@
 
 All notable changes to this project will be documented in this file.
 
-## [0.1.0] - 2026-02-27
+## [0.1.0] - 2026-08-04
+
+### Bug Fixes
+
+- *(manifest)* Satisfy the Tabularium driver-kind contract by @NewtTheWolf
+
+### Documentation
+
+- Fix Discord shields.io badge server id by @debba
 
 ### Features
 
-- *(mongodb)* Initial MongoDB plugin supporting collections, schema inference, CRUD, indexes and aggregation pipelines by @debba
+- *(mongodb)* Add initial plugin implementation and release pipeline by @debba
+- *(mongodb)* Support Atlas and full connection URIs by @Robbyfuu
+- Migrate to the .tabularium manifest for the Tabularium registry by @NewtTheWolf
+
+### Miscellaneous
+
+- Update repository references to tabularis-mongodb-plugin by @debba
+- Switch Discord invite URL to discord.com/invite/K2hmhfHRSt by @debba
 
