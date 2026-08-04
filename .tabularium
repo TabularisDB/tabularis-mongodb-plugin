@@ -1,8 +1,8 @@
 {
-  "name": "mongodb",
+  "name": "mongodb-atlas",
   "version": "0.1.0",
   "kind": "driver",
-  "description": "MongoDB NoSQL database driver",
+  "description": "MongoDB NoSQL database driver with Atlas (mongodb+srv) support",
   "engine": "mongodb",
   "paradigms": [
     "document"
