@@ -40,8 +40,8 @@ This plugin enables Tabularis to connect to any MongoDB instance and provides co
 - **Collection Browsing** — List databases, collections, and infer schema by sampling documents.
 - **Schema Inference** — Automatically detects field names and BSON types by sampling up to 100 documents per collection.
 - **Index Inspection** — List collection indexes with name, columns, uniqueness, and primary flag.
-- **Query Execution** — Run `find`, `findOne`, `aggregate`, and `count` queries using MongoDB shell syntax.
-- **Inline Editing** — Insert, update, and delete documents directly from the Tabularis data grid.
+- **Query Execution** — Run read (`find`, `findOne`, `aggregate`, `count`) and write (`insertOne`, `updateMany`, `deleteMany`, `createIndex`, `drop`, and more) commands using MongoDB shell syntax.
+- **Inline Editing** — Insert, update, and delete documents directly from the Tabularis data grid, keeping the BSON type each field already uses.
 - **ObjectId Handling** — Automatically converts string primary key values to `ObjectId` when filtering by `_id`.
 - **DDL-equivalent Generation** — Generates MongoDB shell commands for `createCollection`, `createIndex`, `$rename`, and more.
 - **Cross-platform** — Pre-built binaries for Linux (x86_64, aarch64), macOS (x86_64, aarch64), and Windows (x86_64).
@@ -121,12 +121,27 @@ db.orders.aggregate([
 
 // Count documents
 db.users.countDocuments({"role": "admin"})
+
+// Write documents
+db.users.insertOne({"name": "Ada", "age": 36})
+db.users.updateMany({"active": true}, {"$set": {"role": "member"}})
+db.users.deleteOne({"name": "Ada"})
+
+// Collection and index management
+db.createCollection("orders")
+db.users.createIndex({"email": 1}, {"name": "idx_email", "unique": true})
+db.users.dropIndex("idx_email")
+db.orders.drop()
 ```
+
+Arguments are parsed as strict JSON, so keys and string values need double quotes.
 
 ### SQL-like (for table browsing)
 
 When Tabularis browses a collection it sends `SELECT * FROM collection_name`.
 The plugin automatically converts this to `find({})` on the named collection.
+Deleting a collection from the explorer sends `DROP TABLE collection_name`, which
+the plugin runs as a collection drop.
 
 ## Supported Operations
 
@@ -139,10 +154,10 @@ The plugin automatically converts this to `find({})` on the named collection.
 | `get_columns` | Infer fields and types by sampling documents |
 | `get_foreign_keys` | Returns `[]` (no FK constraints in MongoDB) |
 | `get_indexes` | List indexes for a collection |
-| `execute_query` | Run shell-syntax queries with pagination |
+| `execute_query` | Run shell-syntax read and write commands with pagination |
 | `insert_record` | Insert a new document |
-| `update_record` | Update a single field by `_id` (or other PK) |
-| `delete_record` | Delete a document by `_id` (or other PK) |
+| `update_record` | Update a single field, located by the primary key map sent by the host |
+| `delete_record` | Delete a document, located by the primary key map sent by the host |
 | `get_schema_snapshot` | Full schema dump (all collections + inferred columns) |
 | `get_all_columns_batch` | Inferred columns for all collections |
 | `get_all_foreign_keys_batch` | Returns `{}` |
