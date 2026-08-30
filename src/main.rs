@@ -5,6 +5,9 @@ use serde_json::{json, Value as JsonValue};
 use std::collections::{HashMap, HashSet};
 use std::io::{self, BufRead, Write};
 
+/// Documents inspected when inferring the shape of a collection.
+const SAMPLE_SIZE: i64 = 100;
+
 // ---------------------------------------------------------------------------
 // Main loop
 // ---------------------------------------------------------------------------
@@ -176,18 +179,20 @@ fn main() {
             }
             "update_record" => {
                 let table = params.get("table").and_then(|t| t.as_str()).unwrap_or("");
-                let pk_col = params
-                    .get("pk_col")
-                    .and_then(|p| p.as_str())
-                    .unwrap_or("_id");
-                let pk_val = params.get("pk_val").cloned().unwrap_or(JsonValue::Null);
                 let col_name = params
                     .get("col_name")
                     .and_then(|c| c.as_str())
                     .unwrap_or("");
                 let new_val = params.get("new_val").cloned().unwrap_or(JsonValue::Null);
+                let filter = match build_pk_filter(params) {
+                    Ok(filter) => filter,
+                    Err(e) => {
+                        send_error(&mut stdout, id, -32014, &e);
+                        continue;
+                    }
+                };
                 match rt.block_on(update_record(
-                    client, &db_name, table, pk_col, &pk_val, col_name, &new_val,
+                    client, &db_name, table, filter, col_name, &new_val,
                 )) {
                     Ok(n) => send_success(&mut stdout, id, json!(n)),
                     Err(e) => send_error(&mut stdout, id, -32014, &e),
@@ -195,12 +200,14 @@ fn main() {
             }
             "delete_record" => {
                 let table = params.get("table").and_then(|t| t.as_str()).unwrap_or("");
-                let pk_col = params
-                    .get("pk_col")
-                    .and_then(|p| p.as_str())
-                    .unwrap_or("_id");
-                let pk_val = params.get("pk_val").cloned().unwrap_or(JsonValue::Null);
-                match rt.block_on(delete_record(client, &db_name, table, pk_col, &pk_val)) {
+                let filter = match build_pk_filter(params) {
+                    Ok(filter) => filter,
+                    Err(e) => {
+                        send_error(&mut stdout, id, -32015, &e);
+                        continue;
+                    }
+                };
+                match rt.block_on(delete_record(client, &db_name, table, filter)) {
                     Ok(n) => send_success(&mut stdout, id, json!(n)),
                     Err(e) => send_error(&mut stdout, id, -32015, &e),
                 }
@@ -261,6 +268,10 @@ fn main() {
             }
             "get_create_index_sql" => {
                 let table = params.get("table").and_then(|t| t.as_str()).unwrap_or("");
+                let index_name = params
+                    .get("index_name")
+                    .and_then(|n| n.as_str())
+                    .unwrap_or("");
                 let columns: Vec<String> = params
                     .get("columns")
                     .and_then(|c| c.as_array())
@@ -274,19 +285,10 @@ fn main() {
                     .get("is_unique")
                     .and_then(|u| u.as_bool())
                     .unwrap_or(false);
-                let key_doc: String = columns
-                    .iter()
-                    .map(|c| format!("\"{}\": 1", c))
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                let unique_opt = if is_unique { ", { unique: true }" } else { "" };
                 send_success(
                     &mut stdout,
                     id,
-                    json!([format!(
-                        "db.{}.createIndex({{ {} }}{})",
-                        table, key_doc, unique_opt
-                    )]),
+                    json!([create_index_command(table, index_name, &columns, is_unique)]),
                 );
             }
             "get_create_foreign_key_sql" => {
@@ -316,11 +318,14 @@ fn main() {
                 );
             }
             _ => {
+                // The host only sees the message, and falls back to its own
+                // dialect-neutral implementation when it reads "method not
+                // found" — so the standard wording has to be in the text.
                 send_error(
                     &mut stdout,
                     id,
                     -32601,
-                    &format!("Method '{}' not implemented", method),
+                    &format!("Method not found: '{}' is not implemented", method),
                 );
             }
         }
@@ -731,7 +736,7 @@ async fn get_columns(
     let db = client.database(db_name);
     let collection: mongodb::Collection<Document> = db.collection(collection_name);
 
-    let options = FindOptions::builder().limit(100i64).build();
+    let options = FindOptions::builder().limit(SAMPLE_SIZE).build();
     let mut cursor = collection
         .find(doc! {})
         .with_options(options)
@@ -1057,6 +1062,144 @@ fn parse_sql_from_clause(query: &str) -> Option<String> {
     }
 }
 
+/// Tries to extract a collection name from `db.createCollection("name")`,
+/// which is what the host runs when a table is created.
+fn parse_create_collection(query: &str) -> Option<String> {
+    let rest = query.trim().trim_end_matches(';').strip_prefix("db.")?;
+    let args = rest
+        .strip_prefix("createCollection")?
+        .trim()
+        .strip_prefix('(')?;
+    let name = find_balanced_args(args)?
+        .trim()
+        .trim_matches(|c| c == '"' || c == '\'');
+    if name.is_empty() {
+        None
+    } else {
+        Some(name.to_string())
+    }
+}
+
+/// Tries to extract a collection name from a SQL-like `DROP TABLE collection`
+/// statement, which is what the explorer sidebar sends to delete a collection.
+fn parse_sql_drop_table(query: &str) -> Option<String> {
+    let q = query.trim().trim_end_matches(';');
+    let (head, rest) = q.split_at_checked(10)?;
+    if !head.eq_ignore_ascii_case("DROP TABLE") {
+        return None;
+    }
+    let name = rest.split_whitespace().next()?;
+    let name = name.trim_matches(|c| c == '"' || c == '`' || c == '\'');
+    if name.is_empty() {
+        None
+    } else {
+        Some(name.to_string())
+    }
+}
+
+/// Renders the shell command that creates an index, keeping the name and the
+/// uniqueness the user chose. Options are emitted as strict JSON so the same
+/// plugin can parse the statement back when the host executes it.
+fn create_index_command(
+    table: &str,
+    index_name: &str,
+    columns: &[String],
+    is_unique: bool,
+) -> String {
+    let keys = columns
+        .iter()
+        .map(|c| format!("\"{}\": 1", c))
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    let mut options: Vec<String> = Vec::new();
+    if !index_name.is_empty() {
+        options.push(format!("\"name\": \"{}\"", index_name));
+    }
+    if is_unique {
+        options.push("\"unique\": true".to_string());
+    }
+
+    if options.is_empty() {
+        format!("db.{}.createIndex({{{}}})", table, keys)
+    } else {
+        format!(
+            "db.{}.createIndex({{{}}}, {{{}}})",
+            table,
+            keys,
+            options.join(", ")
+        )
+    }
+}
+
+/// Picks one representative value per field from a sample of documents, using
+/// the type that appears most often. Write paths use it to keep the type a
+/// field already has when the data grid sends the value as text.
+fn field_type_samples(docs: &[Document]) -> Document {
+    // field → type name → (occurrences, first value seen with that type)
+    let mut seen: HashMap<&str, HashMap<&'static str, (usize, Bson)>> = HashMap::new();
+
+    for doc in docs {
+        for (key, value) in doc {
+            let entry = seen
+                .entry(key.as_str())
+                .or_default()
+                .entry(bson_type_name(value))
+                .or_insert_with(|| (0, value.clone()));
+            entry.0 += 1;
+        }
+    }
+
+    seen.into_iter()
+        .filter_map(|(key, types)| {
+            types
+                .into_values()
+                .max_by_key(|(count, _)| *count)
+                .map(|(_, sample)| (key.to_string(), sample))
+        })
+        .collect()
+}
+
+/// Reads a sample of the collection to learn the BSON type of each field.
+async fn sample_collection_types(
+    collection: &mongodb::Collection<Document>,
+) -> Result<Document, String> {
+    let options = FindOptions::builder().limit(SAMPLE_SIZE).build();
+    let mut cursor = collection
+        .find(doc! {})
+        .with_options(options)
+        .await
+        .map_err(safe_mongo_error)?;
+
+    let mut docs: Vec<Document> = Vec::new();
+    while let Some(result) = cursor.next().await {
+        docs.push(result.map_err(safe_mongo_error)?);
+    }
+
+    Ok(field_type_samples(&docs))
+}
+
+/// Drops `//` comment lines so a statement made only of comments reads as empty.
+fn strip_comment_lines(query: &str) -> String {
+    query
+        .lines()
+        .filter(|line| !line.trim_start().starts_with("//"))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Builds the response for a statement that writes instead of returning rows.
+fn write_result(affected: u64) -> JsonValue {
+    json!({
+        "columns": [],
+        "rows": [],
+        "affected_rows": affected,
+        "truncated": false,
+        "has_more": false,
+        "pagination": null,
+    })
+}
+
 async fn execute_query(
     client: &Client,
     db_name: &str,
@@ -1064,7 +1207,30 @@ async fn execute_query(
     limit: Option<u32>,
     page: u32,
 ) -> Result<JsonValue, String> {
-    let q = query.trim();
+    let q = strip_comment_lines(query);
+    let q = q.trim();
+
+    // Schema changes MongoDB does not need (adding a field, keeping a name)
+    // are reported by this driver as a comment, so there is nothing to run.
+    if q.is_empty() {
+        return Ok(write_result(0));
+    }
+
+    if let Some(collection_name) = parse_create_collection(q) {
+        client
+            .database(db_name)
+            .create_collection(&collection_name)
+            .await
+            .map_err(safe_mongo_error)?;
+        return Ok(write_result(0));
+    }
+
+    if let Some(collection_name) = parse_sql_drop_table(q) {
+        let collection: mongodb::Collection<Document> =
+            client.database(db_name).collection(&collection_name);
+        collection.drop().await.map_err(safe_mongo_error)?;
+        return Ok(write_result(0));
+    }
 
     if let Some(parsed) = parse_shell_query(q) {
         return dispatch_shell_query(client, db_name, parsed, limit, page).await;
@@ -1150,8 +1316,121 @@ async fn dispatch_shell_query(
                 "pagination": null,
             }))
         }
+        "insertOne" => {
+            let document = parse_arg_as_doc(args.first())?;
+            let db = client.database(db_name);
+            let collection: mongodb::Collection<Document> = db.collection(coll);
+            collection
+                .insert_one(document)
+                .await
+                .map_err(safe_mongo_error)?;
+            Ok(write_result(1))
+        }
+        "insertMany" => {
+            let documents = parse_arg_as_pipeline(args.first())?;
+            let db = client.database(db_name);
+            let collection: mongodb::Collection<Document> = db.collection(coll);
+            let result = collection
+                .insert_many(documents)
+                .await
+                .map_err(safe_mongo_error)?;
+            Ok(write_result(result.inserted_ids.len() as u64))
+        }
+        "updateOne" | "updateMany" | "replaceOne" => {
+            let filter = parse_arg_as_doc(args.first())?;
+            let update = parse_arg_as_doc(args.get(1))?;
+            let db = client.database(db_name);
+            let collection: mongodb::Collection<Document> = db.collection(coll);
+            let modified = match parsed.operation.as_str() {
+                "updateOne" => {
+                    collection
+                        .update_one(filter, update)
+                        .await
+                        .map_err(safe_mongo_error)?
+                        .modified_count
+                }
+                "updateMany" => {
+                    collection
+                        .update_many(filter, update)
+                        .await
+                        .map_err(safe_mongo_error)?
+                        .modified_count
+                }
+                _ => {
+                    collection
+                        .replace_one(filter, update)
+                        .await
+                        .map_err(safe_mongo_error)?
+                        .modified_count
+                }
+            };
+            Ok(write_result(modified))
+        }
+        "deleteOne" | "deleteMany" => {
+            let filter = parse_arg_as_doc(args.first())?;
+            let db = client.database(db_name);
+            let collection: mongodb::Collection<Document> = db.collection(coll);
+            let deleted = if parsed.operation == "deleteOne" {
+                collection
+                    .delete_one(filter)
+                    .await
+                    .map_err(safe_mongo_error)?
+                    .deleted_count
+            } else {
+                collection
+                    .delete_many(filter)
+                    .await
+                    .map_err(safe_mongo_error)?
+                    .deleted_count
+            };
+            Ok(write_result(deleted))
+        }
+        "createIndex" => {
+            let keys = parse_arg_as_doc(args.first())?;
+            let options = parse_arg_as_doc(args.get(1))?;
+            if keys.is_empty() {
+                return Err("createIndex requires at least one key".to_string());
+            }
+            let mut command = doc! { "key": &keys };
+            for (key, value) in &options {
+                command.insert(key.clone(), value.clone());
+            }
+            // The raw `createIndexes` command always needs a name; mirror the
+            // one the shell derives from the keys when the caller omits it.
+            command.entry("name".to_string()).or_insert_with(|| {
+                Bson::String(
+                    keys.keys()
+                        .map(|k| format!("{}_1", k))
+                        .collect::<Vec<_>>()
+                        .join("_"),
+                )
+            });
+            client
+                .database(db_name)
+                .run_command(doc! { "createIndexes": coll, "indexes": [command] })
+                .await
+                .map_err(safe_mongo_error)?;
+            Ok(write_result(0))
+        }
+        "dropIndex" => {
+            let name = args
+                .first()
+                .map(|a| a.trim().trim_matches(|c| c == '"' || c == '\''))
+                .filter(|name| !name.is_empty())
+                .ok_or_else(|| "dropIndex requires an index name".to_string())?;
+            drop_index(client, db_name, coll, name).await?;
+            Ok(write_result(0))
+        }
+        "drop" => {
+            let db = client.database(db_name);
+            let collection: mongodb::Collection<Document> = db.collection(coll);
+            collection.drop().await.map_err(safe_mongo_error)?;
+            Ok(write_result(0))
+        }
         op => Err(format!(
-            "Unsupported operation '{}'. Supported: find, findOne, aggregate, count, countDocuments",
+            "Unsupported operation '{}'. Supported: find, findOne, aggregate, count, \
+             countDocuments, insertOne, insertMany, updateOne, updateMany, replaceOne, \
+             deleteOne, deleteMany, createIndex, dropIndex, drop",
             op
         )),
     }
@@ -1288,21 +1567,23 @@ async fn insert_record(
     let db = client.database(db_name);
     let collection: mongodb::Collection<Document> = db.collection(collection_name);
 
-    let doc: Document = data
-        .iter()
-        .filter(|(k, v)| {
-            // Skip null _id so MongoDB auto-generates it
-            !(k.as_str() == "_id" && v.is_null())
-        })
-        .map(|(k, v)| {
-            let bval = if k == "_id" {
-                parse_bson_id(v)
-            } else {
-                json_to_bson(v)
-            };
-            (k.clone(), bval)
-        })
-        .collect();
+    // The data grid sends every field as text, so values are matched against
+    // the types the collection already uses instead of being stored as strings.
+    let samples = sample_collection_types(&collection).await?;
+
+    let mut doc = Document::new();
+    for (key, value) in data {
+        // Skip null _id so MongoDB auto-generates it
+        if key == "_id" && value.is_null() {
+            continue;
+        }
+        let bval = if key == "_id" {
+            parse_bson_id(value)
+        } else {
+            coerce_to_field_type(value, samples.get(key))?
+        };
+        doc.insert(key.clone(), bval);
+    }
 
     collection.insert_one(doc).await.map_err(safe_mongo_error)?;
     Ok(1)
@@ -1312,23 +1593,25 @@ async fn update_record(
     client: &Client,
     db_name: &str,
     collection_name: &str,
-    pk_col: &str,
-    pk_val: &JsonValue,
+    filter: Document,
     col_name: &str,
     new_val: &JsonValue,
 ) -> Result<u64, String> {
+    if col_name.is_empty() {
+        return Err("No column provided to update".to_string());
+    }
+
     let db = client.database(db_name);
     let collection: mongodb::Collection<Document> = db.collection(collection_name);
 
-    let filter_bson = if pk_col == "_id" {
-        parse_bson_id(pk_val)
-    } else {
-        json_to_bson(pk_val)
-    };
+    let current = collection
+        .find_one(filter.clone())
+        .await
+        .map_err(safe_mongo_error)?
+        .ok_or_else(|| "No document matches the primary key of this row".to_string())?;
+    let value = coerce_to_field_type(new_val, current.get(col_name))?;
 
-    let filter = doc! { pk_col: filter_bson };
-    let update = doc! { "$set": { col_name: json_to_bson(new_val) } };
-
+    let update = doc! { "$set": { col_name: value } };
     let result = collection
         .update_one(filter, update)
         .await
@@ -1340,19 +1623,11 @@ async fn delete_record(
     client: &Client,
     db_name: &str,
     collection_name: &str,
-    pk_col: &str,
-    pk_val: &JsonValue,
+    filter: Document,
 ) -> Result<u64, String> {
     let db = client.database(db_name);
     let collection: mongodb::Collection<Document> = db.collection(collection_name);
 
-    let filter_bson = if pk_col == "_id" {
-        parse_bson_id(pk_val)
-    } else {
-        json_to_bson(pk_val)
-    };
-
-    let filter = doc! { pk_col: filter_bson };
     let result = collection
         .delete_one(filter)
         .await
@@ -1510,6 +1785,90 @@ fn parse_bson_id(val: &JsonValue) -> Bson {
         return Bson::String(s.clone());
     }
     json_to_bson(val)
+}
+
+/// Builds the document filter that locates the record a write targets.
+///
+/// The host sends the primary key as `pk_map` so composite keys survive the
+/// round trip; the legacy `pk_col`/`pk_val` pair is still accepted for older
+/// hosts. Requests without a key are rejected instead of silently matching
+/// nothing.
+fn build_pk_filter(params: &JsonValue) -> Result<Document, String> {
+    let entries: Vec<(String, JsonValue)> = match params.get("pk_map").and_then(|m| m.as_object()) {
+        Some(map) if !map.is_empty() => map.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
+        _ => {
+            let pk_col = params
+                .get("pk_col")
+                .and_then(|c| c.as_str())
+                .filter(|c| !c.is_empty())
+                .ok_or_else(|| "No primary key provided to locate the record".to_string())?;
+            let pk_val = params.get("pk_val").cloned().unwrap_or(JsonValue::Null);
+            vec![(pk_col.to_string(), pk_val)]
+        }
+    };
+
+    Ok(entries
+        .into_iter()
+        .map(|(key, value)| {
+            let bson = if key == "_id" {
+                parse_bson_id(&value)
+            } else {
+                json_to_bson(&value)
+            };
+            (key, bson)
+        })
+        .collect())
+}
+
+/// Converts an edited value to the BSON type the field already holds.
+///
+/// The data grid commits every edit as text, so writing it verbatim would turn
+/// an `Int32` field into a `String`. Fields that are absent, string typed, or
+/// edited to `null` are stored as sent.
+fn coerce_to_field_type(new_val: &JsonValue, current: Option<&Bson>) -> Result<Bson, String> {
+    let (text, current) = match (new_val, current) {
+        (JsonValue::String(text), Some(current)) => (text, current),
+        _ => return Ok(json_to_bson(new_val)),
+    };
+
+    let invalid = |type_name: &str| format!("'{}' is not a valid {} value", text, type_name);
+
+    match current {
+        Bson::Int32(_) => text
+            .trim()
+            .parse::<i32>()
+            .map(Bson::Int32)
+            .map_err(|_| invalid("Int32")),
+        Bson::Int64(_) => text
+            .trim()
+            .parse::<i64>()
+            .map(Bson::Int64)
+            .map_err(|_| invalid("Int64")),
+        Bson::Double(_) => text
+            .trim()
+            .parse::<f64>()
+            .map(Bson::Double)
+            .map_err(|_| invalid("Double")),
+        Bson::Boolean(_) => match text.trim().to_ascii_lowercase().as_str() {
+            "true" | "1" => Ok(Bson::Boolean(true)),
+            "false" | "0" => Ok(Bson::Boolean(false)),
+            _ => Err(invalid("Boolean")),
+        },
+        Bson::DateTime(_) => text
+            .trim()
+            .parse::<i64>()
+            .map(|millis| Bson::DateTime(bson::DateTime::from_millis(millis)))
+            .map_err(|_| invalid("Date")),
+        Bson::Decimal128(_) => text
+            .trim()
+            .parse::<bson::Decimal128>()
+            .map(Bson::Decimal128)
+            .map_err(|_| invalid("Decimal128")),
+        Bson::ObjectId(_) => bson::oid::ObjectId::parse_str(text.trim())
+            .map(Bson::ObjectId)
+            .map_err(|_| invalid("ObjectId")),
+        _ => Ok(json_to_bson(new_val)),
+    }
 }
 
 /// Collects unique column names from a slice of documents,
@@ -1808,5 +2167,175 @@ mod tests {
         for secret in ["banker", "p%40ss", "one", "user", "secret", "two"] {
             assert!(!masked.contains(secret));
         }
+    }
+
+    #[test]
+    fn pk_filter_uses_the_pk_map_sent_by_the_host() {
+        // The host serialises the primary key as `pk_map` (see the plugin
+        // driver in the desktop app), not as a `pk_col`/`pk_val` pair.
+        let params = json!({
+            "table": "people",
+            "pk_map": { "_id": "507f1f77bcf86cd799439011" },
+            "col_name": "name",
+            "new_val": "Grace"
+        });
+
+        let filter = build_pk_filter(&params).unwrap();
+
+        assert_eq!(
+            filter.get("_id").unwrap(),
+            &Bson::ObjectId(bson::oid::ObjectId::parse_str("507f1f77bcf86cd799439011").unwrap())
+        );
+    }
+
+    #[test]
+    fn pk_filter_accepts_composite_keys() {
+        let params = json!({ "pk_map": { "tenant": "acme", "code": 7 } });
+
+        let filter = build_pk_filter(&params).unwrap();
+
+        assert_eq!(filter.get("tenant").unwrap(), &Bson::String("acme".into()));
+        assert_eq!(filter.get("code").unwrap(), &Bson::Int64(7));
+    }
+
+    #[test]
+    fn pk_filter_falls_back_to_the_legacy_pk_col_pair() {
+        let params = json!({ "pk_col": "_id", "pk_val": "507f1f77bcf86cd799439011" });
+
+        let filter = build_pk_filter(&params).unwrap();
+
+        assert_eq!(
+            filter.get("_id").unwrap(),
+            &Bson::ObjectId(bson::oid::ObjectId::parse_str("507f1f77bcf86cd799439011").unwrap())
+        );
+    }
+
+    #[test]
+    fn pk_filter_rejects_a_request_without_a_primary_key() {
+        // Without this guard the filter would be `{ "_id": null }`, which
+        // silently matches nothing and reports zero rows updated.
+        assert!(build_pk_filter(&json!({ "table": "people" })).is_err());
+        assert!(build_pk_filter(&json!({ "pk_map": {} })).is_err());
+    }
+
+    #[test]
+    fn edited_values_keep_the_bson_type_of_the_stored_field() {
+        // The data grid commits every edit as text, so a numeric field would
+        // turn into a string without this coercion.
+        assert_eq!(
+            coerce_to_field_type(&json!("42"), Some(&Bson::Int32(1))).unwrap(),
+            Bson::Int32(42)
+        );
+        assert_eq!(
+            coerce_to_field_type(&json!("36.5"), Some(&Bson::Double(0.0))).unwrap(),
+            Bson::Double(36.5)
+        );
+        assert_eq!(
+            coerce_to_field_type(&json!("true"), Some(&Bson::Boolean(false))).unwrap(),
+            Bson::Boolean(true)
+        );
+        assert_eq!(
+            coerce_to_field_type(
+                &json!("1700000000000"),
+                Some(&Bson::DateTime(bson::DateTime::from_millis(0)))
+            )
+            .unwrap(),
+            Bson::DateTime(bson::DateTime::from_millis(1_700_000_000_000))
+        );
+    }
+
+    #[test]
+    fn unparsable_edits_report_an_error_instead_of_changing_the_field_type() {
+        assert!(coerce_to_field_type(&json!("abc"), Some(&Bson::Int32(1))).is_err());
+    }
+
+    #[test]
+    fn edits_on_unknown_or_string_fields_are_stored_as_sent() {
+        assert_eq!(
+            coerce_to_field_type(&json!("42"), None).unwrap(),
+            Bson::String("42".into())
+        );
+        assert_eq!(
+            coerce_to_field_type(&json!("42"), Some(&Bson::String(String::new()))).unwrap(),
+            Bson::String("42".into())
+        );
+        assert_eq!(
+            coerce_to_field_type(&JsonValue::Null, Some(&Bson::Int32(1))).unwrap(),
+            Bson::Null
+        );
+    }
+
+    #[test]
+    fn create_collection_command_is_recognised() {
+        assert_eq!(
+            parse_create_collection("db.createCollection(\"orders\")"),
+            Some("orders".to_string())
+        );
+        assert_eq!(
+            parse_create_collection("db.createCollection('orders');"),
+            Some("orders".to_string())
+        );
+        assert_eq!(parse_create_collection("db.orders.find({})"), None);
+    }
+
+    #[test]
+    fn drop_table_statement_is_recognised() {
+        // The explorer sidebar deletes a collection by sending plain SQL.
+        assert_eq!(
+            parse_sql_drop_table("DROP TABLE `orders`"),
+            Some("orders".to_string())
+        );
+        assert_eq!(
+            parse_sql_drop_table("drop table \"orders\";"),
+            Some("orders".to_string())
+        );
+        assert_eq!(parse_sql_drop_table("SELECT * FROM orders"), None);
+    }
+
+    #[test]
+    fn field_samples_expose_the_dominant_type_of_each_field() {
+        let docs = vec![
+            doc! { "age": 30i32, "name": "Ada" },
+            doc! { "age": 31i32, "name": "Grace" },
+            doc! { "age": "unknown", "score": 1.5 },
+        ];
+
+        let samples = field_type_samples(&docs);
+
+        assert_eq!(bson_type_name(samples.get("age").unwrap()), "Int32");
+        assert_eq!(bson_type_name(samples.get("name").unwrap()), "String");
+        assert_eq!(bson_type_name(samples.get("score").unwrap()), "Double");
+    }
+
+    #[test]
+    fn inserted_values_keep_the_type_the_collection_already_uses() {
+        let samples = doc! { "age": 0i32 };
+
+        assert_eq!(
+            coerce_to_field_type(&json!("52"), samples.get("age")).unwrap(),
+            Bson::Int32(52)
+        );
+    }
+
+    #[test]
+    fn index_creation_keeps_the_name_and_uniqueness_chosen_by_the_user() {
+        let statement = create_index_command("people", "idx_name", &["name".to_string()], true);
+
+        assert_eq!(
+            statement,
+            "db.people.createIndex({\"name\": 1}, {\"name\": \"idx_name\", \"unique\": true})"
+        );
+        assert!(parse_shell_query(&statement).is_some());
+    }
+
+    #[test]
+    fn comment_only_statements_are_treated_as_no_ops() {
+        // Schemaless drivers answer some DDL requests with a comment; the host
+        // still runs it, so it has to be recognised as "nothing to do".
+        assert_eq!(strip_comment_lines("// nothing to do").trim(), "");
+        assert_eq!(
+            strip_comment_lines("// note\ndb.people.find({})").trim(),
+            "db.people.find({})"
+        );
     }
 }
