@@ -1,5 +1,6 @@
 {
-  "name": "mongodb-atlas",
+  "id": "mongodb-atlas",
+  "name": "MongoDB Atlas",
   "version": "0.2.0",
   "kind": "driver",
   "description": "MongoDB NoSQL database driver with Atlas (mongodb+srv) support",
