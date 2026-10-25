@@ -2,6 +2,20 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.2.1] - 2026-10-25
+
+### Bug Fixes
+
+- *(deps)* Secure mongodb dependencies and lock release builds (#11) by @debba in [#11](https://github.com/TabularisDB/tabularis-mongodb-plugin/pull/11)
+
+### Documentation
+
+- Update Tabularis logo URL to packages/web-ui/public by @debba
+- Use Tabularis banner and add native support banner in README by @debba
+
+### Miscellaneous
+
+- *(manifest)* Declare stable id and display name (#10) by @debba in [#10](https://github.com/TabularisDB/tabularis-mongodb-plugin/pull/10)
 ## [0.2.0] - 2026-08-30
 
 ### Bug Fixes
