@@ -337,6 +337,102 @@ fn main() {
 // ---------------------------------------------------------------------------
 
 fn build_uri(params: &JsonValue) -> Result<String, String> {
+    let uri = build_base_uri(params)?;
+    apply_socks5_proxy(uri, params)
+}
+
+/// URI options that configure the driver's own SOCKS5 proxy.
+const URI_PROXY_OPTIONS: [&str; 4] = ["proxyHost", "proxyPort", "proxyUsername", "proxyPassword"];
+
+/// Routes the driver through the SOCKS5 proxy the host opens over SSH
+/// (`socks5_proxy_host` / `socks5_proxy_port`, plus
+/// `socks5_proxy_username` / `socks5_proxy_password` when the listener
+/// requires them), so every node the driver connects to, including the
+/// nodes discovered through SRV, goes through the tunnel. Hostnames are
+/// passed to the proxy unresolved, so the SSH server resolves them. SRV and
+/// TXT lookups for `mongodb+srv://` still use the local resolver.
+///
+/// A URI that already configures a proxy is rejected: honouring it would
+/// silently bypass the SSH tunnel the connection has enabled.
+fn apply_socks5_proxy(mut uri: String, params: &JsonValue) -> Result<String, String> {
+    let Some(host) = get_string_param(params, "socks5_proxy_host")? else {
+        return Ok(uri);
+    };
+    let port = match params.get("socks5_proxy_port") {
+        Some(JsonValue::Number(port)) => port
+            .as_u64()
+            .filter(|port| (1..=65535).contains(port))
+            .ok_or("Parameter 'socks5_proxy_port' must be a port number")?,
+        _ => {
+            return Err(
+                "Parameter 'socks5_proxy_port' is required with 'socks5_proxy_host'".to_string(),
+            )
+        }
+    };
+    let credentials = match (
+        get_string_param(params, "socks5_proxy_username")?,
+        get_string_param(params, "socks5_proxy_password")?,
+    ) {
+        (Some(username), Some(password)) => Some((username, password)),
+        (None, None) => None,
+        _ => {
+            return Err(
+                "Parameters 'socks5_proxy_username' and 'socks5_proxy_password' \
+                 must be provided together"
+                    .to_string(),
+            )
+        }
+    };
+    if let Some(option) = URI_PROXY_OPTIONS
+        .into_iter()
+        .find(|option| uri_has_option(&uri, option))
+    {
+        return Err(format!(
+            "The connection URI sets '{option}', but SSH is enabled for this connection \
+             and Tabularis routes it through the SSH tunnel's SOCKS5 proxy. Remove the \
+             proxy options from the URI or disable SSH."
+        ));
+    }
+
+    match uri.find('?') {
+        Some(_) if uri.ends_with('?') || uri.ends_with('&') => {}
+        Some(_) => uri.push('&'),
+        None => {
+            let authority_start = uri.find("://").map(|index| index + 3).unwrap_or(0);
+            if !uri[authority_start..].contains('/') {
+                uri.push('/');
+            }
+            uri.push('?');
+        }
+    }
+    uri.push_str(&format!(
+        "proxyHost={}&proxyPort={}",
+        encode_uri_component(host),
+        port
+    ));
+    if let Some((username, password)) = credentials {
+        uri.push_str(&format!(
+            "&proxyUsername={}&proxyPassword={}",
+            encode_uri_component(username),
+            encode_uri_component(password)
+        ));
+    }
+    Ok(uri)
+}
+
+fn uri_has_option(uri: &str, name: &str) -> bool {
+    uri.split_once('?').is_some_and(|(_, query)| {
+        query.split('&').any(|option| {
+            option
+                .split('=')
+                .next()
+                .unwrap_or("")
+                .eq_ignore_ascii_case(name)
+        })
+    })
+}
+
+fn build_base_uri(params: &JsonValue) -> Result<String, String> {
     const URI_KEYS: [&str; 7] = [
         "connection_string",
         "connectionString",
@@ -1933,6 +2029,151 @@ mod tests {
             parse_sql_from_clause("SELECT * FROM plans"),
             Some("plans".to_string())
         );
+    }
+
+    #[test]
+    fn socks5_proxy_is_appended_to_an_srv_uri_with_options() {
+        let params = json!({
+            "connection_uri": "mongodb+srv://u:p@cluster0.example.mongodb.net/admin?authSource=admin",
+            "socks5_proxy_host": "127.0.0.1",
+            "socks5_proxy_port": 40000
+        });
+
+        assert_eq!(
+            build_uri(&params).unwrap(),
+            "mongodb+srv://u:p@cluster0.example.mongodb.net/admin?authSource=admin&proxyHost=127.0.0.1&proxyPort=40000"
+        );
+    }
+
+    #[test]
+    fn socks5_proxy_adds_the_slash_before_the_query_when_there_is_no_path() {
+        let params = json!({
+            "connection_uri": "mongodb+srv://u:p@cluster0.example.mongodb.net",
+            "socks5_proxy_host": "127.0.0.1",
+            "socks5_proxy_port": 40000
+        });
+
+        assert_eq!(
+            build_uri(&params).unwrap(),
+            "mongodb+srv://u:p@cluster0.example.mongodb.net/?proxyHost=127.0.0.1&proxyPort=40000"
+        );
+    }
+
+    #[test]
+    fn socks5_proxy_rejects_a_proxy_already_in_the_uri() {
+        for (query, option) in [
+            ("PROXYHOST=10.0.0.1&proxyPort=1080", "proxyHost"),
+            ("proxyPort=1080", "proxyPort"),
+            ("w=majority&proxyUsername=u", "proxyUsername"),
+            ("proxypassword=p", "proxyPassword"),
+        ] {
+            let params = json!({
+                "connection_uri": format!("mongodb://h1:27017,h2:27017/db?{query}"),
+                "socks5_proxy_host": "127.0.0.1",
+                "socks5_proxy_port": 40000
+            });
+
+            let error = build_uri(&params).unwrap_err();
+            assert!(error.contains(&format!("'{option}'")), "{error}");
+            assert!(error.contains("SSH"), "{error}");
+        }
+    }
+
+    #[test]
+    fn uri_proxy_is_kept_without_ssh() {
+        let uri = "mongodb://h1:27017/db?proxyHost=10.0.0.1&proxyPort=1080";
+        let params = json!({ "connection_uri": uri });
+
+        assert_eq!(build_uri(&params).unwrap(), uri);
+    }
+
+    #[test]
+    fn socks5_proxy_credentials_are_appended_encoded() {
+        let params = json!({
+            "connection_uri": "mongodb+srv://u:p@cluster0.example.mongodb.net/admin",
+            "socks5_proxy_host": "127.0.0.1",
+            "socks5_proxy_port": 40000,
+            "socks5_proxy_username": "tabularis-1",
+            "socks5_proxy_password": "p@ss&word="
+        });
+
+        let uri = build_uri(&params).unwrap();
+        assert_eq!(
+            uri,
+            "mongodb+srv://u:p@cluster0.example.mongodb.net/admin?proxyHost=127.0.0.1&proxyPort=40000&proxyUsername=tabularis-1&proxyPassword=p%40ss%26word%3D"
+        );
+        let parsed = mongodb::options::ConnectionString::parse(uri.replace(
+            "mongodb+srv://u:p@cluster0.example.mongodb.net",
+            "mongodb://u:p@h1:27017",
+        ));
+        let proxy = parsed.unwrap().socks5_proxy.unwrap();
+        assert_eq!(
+            proxy.authentication,
+            Some(("tabularis-1".into(), "p@ss&word=".into()))
+        );
+    }
+
+    #[test]
+    fn socks5_proxy_credentials_must_come_together() {
+        for (username, password) in [(json!("user"), json!(null)), (json!(null), json!("secret"))] {
+            let params = json!({
+                "connection_uri": "mongodb://h1:27017/db",
+                "socks5_proxy_host": "127.0.0.1",
+                "socks5_proxy_port": 40000,
+                "socks5_proxy_username": username,
+                "socks5_proxy_password": password
+            });
+
+            assert!(build_uri(&params)
+                .unwrap_err()
+                .contains("provided together"));
+        }
+    }
+
+    #[test]
+    fn masked_errors_hide_the_proxy_password() {
+        let message = safe_mongo_error(
+            "bad uri mongodb://h1:27017/db?proxyHost=127.0.0.1&proxyPort=1&proxyUsername=u&proxyPassword=hunter2",
+        );
+
+        assert!(!message.contains("hunter2"), "{message}");
+    }
+
+    #[test]
+    fn socks5_proxy_also_applies_to_legacy_fields() {
+        let params = json!({
+            "host": "db.internal",
+            "socks5_proxy_host": "127.0.0.1",
+            "socks5_proxy_port": 40000
+        });
+
+        assert_eq!(
+            build_uri(&params).unwrap(),
+            "mongodb://db.internal:27017/admin?proxyHost=127.0.0.1&proxyPort=40000"
+        );
+    }
+
+    #[test]
+    fn socks5_proxy_requires_a_valid_port() {
+        let uri = "mongodb+srv://u:p@cluster0.example.mongodb.net/admin";
+        for port in [json!(null), json!(0), json!(70000), json!("1080")] {
+            let params = json!({
+                "connection_uri": uri,
+                "socks5_proxy_host": "127.0.0.1",
+                "socks5_proxy_port": port
+            });
+            assert!(build_uri(&params)
+                .unwrap_err()
+                .contains("socks5_proxy_port"));
+        }
+    }
+
+    #[test]
+    fn uri_is_unchanged_without_a_socks5_proxy() {
+        let uri = "mongodb+srv://u:p@cluster0.example.mongodb.net/admin";
+        let params = json!({ "connection_uri": uri, "socks5_proxy_port": 40000 });
+
+        assert_eq!(build_uri(&params).unwrap(), uri);
     }
 
     #[test]
