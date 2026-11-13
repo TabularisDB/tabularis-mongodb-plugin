@@ -32,6 +32,7 @@ This plugin enables Tabularis to connect to any MongoDB instance and provides co
 
 - [Features](#features)
 - [Connection Configuration](#connection-configuration)
+  - [SSH tunnels](#ssh-tunnels)
 - [Supported MongoDB Data Types](#supported-mongodb-data-types)
 - [Installation](#installation)
   - [Automatic (via Tabularis)](#automatic-via-tabularis)
@@ -66,6 +67,15 @@ The plugin supports two connection formats:
 The selected database can be supplied by the request `schema`, by the connection's `database` field (as either a string or an array), or by the URI path. If none is provided, the plugin uses `admin`.
 
 Sending `connection_uri` requires the Tabularis host support introduced by [TabularisDB/tabularis#495](https://github.com/TabularisDB/tabularis/pull/495). Older Tabularis versions can continue to use the legacy connection fields.
+
+### SSH tunnels
+
+The manifest declares the `socks5_proxy` capability, so when SSH is enabled for a connection, Tabularis opens a SOCKS5 proxy over the SSH connection and passes it to the plugin as `socks5_proxy_host` and `socks5_proxy_port`, plus `socks5_proxy_username` and `socks5_proxy_password` when the proxy requires authentication. The plugin adds these to the URI as `proxyHost`, `proxyPort`, `proxyUsername` and `proxyPassword`. Every node the driver connects to, including replica-set members it discovers, then goes through the tunnel, and the SSH server resolves node hostnames. This requires a Tabularis version with SOCKS5 tunnel support ([TabularisDB/tabularis#1449](https://github.com/TabularisDB/tabularis/issues/1449)).
+
+Limitations:
+
+- **SRV and TXT lookups stay local.** For `mongodb+srv://`, the driver resolves the SRV and TXT records with the local DNS resolver before it connects. If those records are only published inside the private network, discovery fails; use a `mongodb://` seed list instead.
+- **Proxy options in the URI conflict with SSH.** If the URI already sets `proxyHost`, `proxyPort`, `proxyUsername` or `proxyPassword` while SSH is enabled, the connection fails with an error instead of bypassing the tunnel. Remove the proxy options or disable SSH.
 
 ## Supported MongoDB Data Types
 

@@ -22,6 +22,7 @@
       "mongodb",
       "mongodb+srv"
     ],
+    "socks5_proxy": true,
     "identifier_quote": "`",
     "alter_primary_key": false
   },
